@@ -9,9 +9,12 @@
 #include <set>
 #include <iostream>
 #include <fstream>
+#include <unordered_map>
 
 #include "mmio.c"
 #include "smsh.c"
+
+#define SM_CORES 108
 
 #define CHECK_CUDA(func)                                                       \
 {                                                                              \
@@ -43,6 +46,27 @@ __half* createRandomArray(long int n) {
     }
 
     return array;
+}
+
+/* Counts number of blocks in a row of blocks */
+int findNumBlocks(int *rowPtr, int *colIndex, int rowId, int block_size) {
+
+    std::unordered_map<int, int> hashMap;
+
+    for (int j = 0; j < block_size; j++) {
+        long int id = rowId + j;
+        for (int k = rowPtr[id]; k < rowPtr[id + 1]; k++) {
+            int bucket = (colIndex[k] + block_size - 1) / block_size;
+            if (((colIndex[k]) % block_size) != 0)
+                bucket--;
+            auto it = hashMap.find(bucket);
+            if (it == hashMap.end())
+                hashMap.insert({bucket, 1});
+        }
+    }
+    std::cout << hashMap.size() << std::endl;
+
+    return hashMap.size();
 }
 
 /* Finds the possible amount of column blocks the matrix can have */
@@ -280,7 +304,7 @@ int main(int argc, char *argv[]) {
     /* MTX READING IS FINISH */
     /************************************************************************************************************/
 
-    int   A_ell_blocksize = 32;
+    int   A_ell_blocksize = 16;
     
     /* Pad matrix with extra rows to fit block size */
     int * rowPtr_pad;
@@ -305,6 +329,15 @@ int main(int argc, char *argv[]) {
     int blocks_per_part = (A_num_rows/A_ell_blocksize) / k;
     if ((A_num_rows/A_ell_blocksize) % k != 0)
         blocks_per_part += 1;
+
+    /*PSEUDO CODE*/
+    // compute number of blocks in first row of blocks
+    int   nBlocks      = findNumBlocks(rowPtr_pad, colIndex, ctr, A_ell_blocksize);
+    // add 16 rows each time to the partition until:
+    // - reach atleast 108 rows of blocks (16*108)
+    // - reach atleast 200 000 blocks
+    // finish partition and start new one by computing number of blocks in the first row of blocks
+    // store number of partitions in 'k', store number of rows of each partition in rowsPerPart
 
     /* Initialize variables */
     cusparseHandle_t     handle = NULL;
