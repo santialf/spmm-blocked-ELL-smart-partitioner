@@ -10,11 +10,13 @@
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <vector>
 
 #include "mmio.c"
 #include "smsh.c"
 
 #define SM_CORES 108
+#define MINIMUM_BLOCKS 200000
 
 #define CHECK_CUDA(func)                                                       \
 {                                                                              \
@@ -64,7 +66,6 @@ int findNumBlocks(int *rowPtr, int *colIndex, int rowId, int block_size) {
                 hashMap.insert({bucket, 1});
         }
     }
-    std::cout << hashMap.size() << std::endl;
 
     return hashMap.size();
 }
@@ -323,21 +324,36 @@ int main(int argc, char *argv[]) {
     }   
 
     /* Split matrix into k parts */
-    int k = 16, ctr = 0;
-    int*blocksPerPart = new int[k];
+    int k = 0, ctr = 0;
     long int total = 0;
-    int blocks_per_part = (A_num_rows/A_ell_blocksize) / k;
-    if ((A_num_rows/A_ell_blocksize) % k != 0)
-        blocks_per_part += 1;
 
     /*PSEUDO CODE*/
     // compute number of blocks in first row of blocks
-    int   nBlocks      = findNumBlocks(rowPtr_pad, colIndex, ctr, A_ell_blocksize);
-    // add 16 rows each time to the partition until:
-    // - reach atleast 108 rows of blocks (16*108)
-    // - reach atleast 200 000 blocks
-    // finish partition and start new one by computing number of blocks in the first row of blocks
-    // store number of partitions in 'k', store number of rows of each partition in rowsPerPart
+    std::vector<int> blocksPerPartition;
+    int aux = 0;
+    while (ctr < A_num_rows) {
+        long int blockCtr = 0;
+        int nBlocks = findNumBlocks(rowPtr_pad, colIndex, ctr, A_ell_blocksize);
+        while (1) {
+            blockCtr += nBlocks;
+            ctr += 16;
+            if((((ctr-aux)/16)%SM_CORES == 0 && blockCtr >= MINIMUM_BLOCKS) || (ctr >= A_num_rows))
+                break;
+        }
+        if (ctr >= A_num_rows) {
+            blocksPerPartition[k-1] += (ctr-aux)/16;
+        } else {
+            blocksPerPartition.push_back((ctr-aux)/16);
+            k++;
+        }
+        aux = ctr;
+    }
+    ctr = 0;
+
+    int*blocksPerPart = new int[k];
+    for (int i = 0; i < k; i++) {
+        std::cout << "blocks per partition: " << blocksPerPartition[i] << std::endl;
+    }
 
     /* Initialize variables */
     cusparseHandle_t     handle = NULL;
@@ -376,9 +392,9 @@ int main(int argc, char *argv[]) {
 
         size_t bufferSize = 0;
 
-        int *rowPtr_part = new int[blocks_per_part*A_ell_blocksize + 1];
+        int *rowPtr_part = new int[blocksPerPartition[i]*A_ell_blocksize + 1];
         int A_rows = 0;
-        for (int j=ctr; j<ctr+blocks_per_part*A_ell_blocksize; j++){
+        for (int j=ctr; j<ctr+blocksPerPartition[i]*A_ell_blocksize; j++){
             if (j >= A_num_rows)
                 break;
             rowPtr_part[j - ctr] = rowPtr_pad[j];
