@@ -16,7 +16,7 @@
 #include "smsh.c"
 
 #define SM_CORES 108
-#define MINIMUM_BLOCKS 200000
+#define MINIMUM_BLOCKS 100000
 
 #define CHECK_CUDA(func)                                                       \
 {                                                                              \
@@ -96,7 +96,7 @@ int findMaxNnz(int *rowPtr, int *colIndex, int num_rows, int block_size) {
 }
 
 /* Creates the array of block indexes for the blocked ell format */
-int *createBlockIndex(int *rowPtr, int *colIndex, int num_rows, int block_size, int ell_cols) {
+int *createBlockIndex(int *rowPtr, int *colIndex, int num_rows, int block_size, int ell_cols, int &realBlocks) {
 
     long int mb = num_rows/block_size, nb = ell_cols/block_size;
     if (num_rows % block_size != 0)
@@ -125,8 +125,9 @@ int *createBlockIndex(int *rowPtr, int *colIndex, int num_rows, int block_size, 
             }
         }
         for (std::set<int>::iterator it =mySet.begin(); it != mySet.end(); it++) {
-	    int elem = *it;
-	    hA_columns[ctr++] = elem;
+            int elem = *it;
+            hA_columns[ctr++] = elem;
+            realBlocks++;
         }
         
         ctr = (long int) i*nb+nb;
@@ -305,7 +306,7 @@ int main(int argc, char *argv[]) {
     /* MTX READING IS FINISH */
     /************************************************************************************************************/
 
-    int   A_ell_blocksize = 16;
+    int   A_ell_blocksize = 32;
     
     /* Pad matrix with extra rows to fit block size */
     int * rowPtr_pad;
@@ -327,23 +328,22 @@ int main(int argc, char *argv[]) {
     int k = 0, ctr = 0;
     long int total = 0;
 
-    /*PSEUDO CODE*/
     // compute number of blocks in first row of blocks
-    std::vector<int> blocksPerPartition;
+    std::vector<int> rowsOfBlocksPerPartition;
     int aux = 0;
     while (ctr < A_num_rows) {
         long int blockCtr = 0;
         int nBlocks = findNumBlocks(rowPtr_pad, colIndex, ctr, A_ell_blocksize);
         while (1) {
             blockCtr += nBlocks;
-            ctr += 16;
-            if((((ctr-aux)/16)%SM_CORES == 0 && blockCtr >= MINIMUM_BLOCKS) || (ctr >= A_num_rows))
+            ctr += A_ell_blocksize;
+            if((((ctr-aux)/A_ell_blocksize)%SM_CORES == 0 && blockCtr >= MINIMUM_BLOCKS) || (ctr >= A_num_rows))
                 break;
         }
         if (ctr >= A_num_rows) {
-            blocksPerPartition[k-1] += (ctr-aux)/16;
+            rowsOfBlocksPerPartition[k-1] += (ctr-aux)/A_ell_blocksize;
         } else {
-            blocksPerPartition.push_back((ctr-aux)/16);
+            rowsOfBlocksPerPartition.push_back((ctr-aux)/A_ell_blocksize);
             k++;
         }
         aux = ctr;
@@ -351,9 +351,9 @@ int main(int argc, char *argv[]) {
     ctr = 0;
 
     int*blocksPerPart = new int[k];
-    for (int i = 0; i < k; i++) {
-        std::cout << "blocks per partition: " << blocksPerPartition[i] << std::endl;
-    }
+    int*colsOfBlocksPerPartition = new int[k];
+    int*ghostBlocksPerPartition = new int[k];
+    double*densityPart = new double[k];
 
     /* Initialize variables */
     cusparseHandle_t     handle = NULL;
@@ -368,7 +368,7 @@ int main(int argc, char *argv[]) {
     float beta            = 0.0f;
 
     int   B_num_rows      = A_num_cols;
-    int   B_num_cols      = 64;
+    int   B_num_cols      = 128;
     int   ldb             = B_num_rows;
     int   ldc             = A_num_rows;
     long int   B_size          = (long int) ldb * B_num_cols;
@@ -392,9 +392,9 @@ int main(int argc, char *argv[]) {
 
         size_t bufferSize = 0;
 
-        int *rowPtr_part = new int[blocksPerPartition[i]*A_ell_blocksize + 1];
+        int *rowPtr_part = new int[rowsOfBlocksPerPartition[i]*A_ell_blocksize + 1];
         int A_rows = 0;
-        for (int j=ctr; j<ctr+blocksPerPartition[i]*A_ell_blocksize; j++){
+        for (int j=ctr; j<ctr+rowsOfBlocksPerPartition[i]*A_ell_blocksize; j++){
             if (j >= A_num_rows)
                 break;
             rowPtr_part[j - ctr] = rowPtr_pad[j];
@@ -408,7 +408,8 @@ int main(int argc, char *argv[]) {
         int   A_ell_cols      = findMaxNnz(rowPtr_part, colIndex, A_rows, A_ell_blocksize);
         double   A_num_blocks    = (double)A_ell_cols * (double)A_rows /
                             (A_ell_blocksize * A_ell_blocksize);
-        int   *hA_columns     = createBlockIndex(rowPtr_part, colIndex, A_rows, A_ell_blocksize, A_ell_cols);
+        int realBlocks = 0;
+        int   *hA_columns     = createBlockIndex(rowPtr_part, colIndex, A_rows, A_ell_blocksize, A_ell_cols, realBlocks);
         __half *hA_values     = createValueIndex(rowPtr_part, colIndex, values, hA_columns, A_rows, A_ell_blocksize, A_ell_cols);
 
 	    __half *hC 	      = new __half[(long int) A_rows * B_num_cols * sizeof(__half)];
@@ -452,10 +453,11 @@ int main(int argc, char *argv[]) {
 
         total_blocks += A_num_blocks;
         blocksPerPart[i] = A_num_blocks;
-        double density_part = (double) nnzs_part/A_num_blocks;
-        //std::cout << total_blocks << " density: " << density_part <<std::endl;
+        densityPart[i] = (double) nnzs_part/A_num_blocks;
+        colsOfBlocksPerPartition[i] = A_ell_cols/A_ell_blocksize;
+        ghostBlocksPerPartition[i] = A_num_blocks - realBlocks;
     }
-std::cout << "Total blocks: " <<total_blocks << std::endl;
+    std::cout << "Total blocks: " <<total_blocks << std::endl;
     struct timespec t_start, t_end;
     double elapsedTime, searchTime = 0;
     int numRuns=0;
@@ -489,7 +491,10 @@ std::cout << "Total blocks: " <<total_blocks << std::endl;
         searchTime += ((t_end.tv_sec + ((double) t_end.tv_nsec / 1000000000)) - (t_start.tv_sec + ((double) t_start.tv_nsec / 1000000000))) / numRuns;
         double time_part = ((t_end.tv_sec + ((double) t_end.tv_nsec / 1000000000)) - (t_start.tv_sec + ((double) t_start.tv_nsec / 1000000000))) / numRuns;
         double perf_part = (2* ((double)blocksPerPart[i]) * ((double)A_ell_blocksize*A_ell_blocksize) * ((double)B_num_cols) / 1000000000000) / time_part;
-        std::cout << i << "\tNumber Blocks: " << blocksPerPart[i] << "\tPerf: " << perf_part << std::endl;
+        std::cout << i << "\tNumber Blocks: " << blocksPerPart[i] << "\tRows of blocks: " 
+                  << rowsOfBlocksPerPartition[i] << "\tColumns of blocks: " << colsOfBlocksPerPartition[i] << "\tDensity: " 
+                  << densityPart[i] << "\tGhost blocks: " << ghostBlocksPerPartition[i] 
+                  << " ( " << (double)ghostBlocksPerPartition[i]/(double)blocksPerPart[i]*(double)100 << " %)" << "\tPerf: " << perf_part << std::endl;
         numRuns = 0;
     }
 
