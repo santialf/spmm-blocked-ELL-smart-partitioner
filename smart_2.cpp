@@ -17,8 +17,8 @@
 
 #define SM_CORES 108
 #define MINIMUM_DENSITY 0
-#define MAXIMUM_GHOST_PERC 0.0000000000000000000001
-#define A_ELL_BLOCKSIZE 16
+#define MAXIMUM_GHOST_PERC 0.0000000000001
+#define A_ELL_BLOCKSIZE 32
 #define B_NUM_COLS 64
 
 #define CHECK_CUDA(func)                                                       \
@@ -338,7 +338,6 @@ int main(int argc, char *argv[]) {
     fclose(f);
     /* MTX READING IS FINISH */
     /************************************************************************************************************/
-
     int   A_ell_blocksize = A_ELL_BLOCKSIZE;
     int k = 0, ctr = 0;
     std::vector<int> rowsOfBlocksPerPartition;
@@ -372,7 +371,7 @@ int main(int argc, char *argv[]) {
             nBlocks_next = findNumBlocks(rowPtr_pad, colIndex, ctr, A_ell_blocksize);
             ghostBlockCtr += nBlocks - nBlocks_next;
             blockCtr += nBlocks;
-            if((double)ghostBlockCtr/blockCtr >= MAXIMUM_GHOST_PERC) {
+            if((double)ghostBlockCtr/blockCtr >= MAXIMUM_GHOST_PERC/*nBlocks_next != nBlocks*/) {
             	colsOfBlocksPerPartition.push_back(nBlocks);
                 nBlocks = nBlocks_next;
                 break;
@@ -383,6 +382,7 @@ int main(int argc, char *argv[]) {
         k++;
         aux = ctr;
     }
+    colsOfBlocksPerPartition.push_back(nBlocks);
     ctr = 0;
 
     // Information storing arrays
@@ -393,12 +393,13 @@ int main(int argc, char *argv[]) {
 
     // Initialize variables
     cusparseHandle_t     handle = NULL;
-    cusparseSpMatDescr_t matA[k];
-    cusparseDnMatDescr_t matB, matC[k];
+    cusparseSpMatDescr_t *matA = new cusparseSpMatDescr_t[k];
+    cusparseDnMatDescr_t *matC = new cusparseDnMatDescr_t[k];
+    cusparseDnMatDescr_t matB;
     void**                dBuffer    = new void*[k]();
 
-    int    *dA_columns[k];
-    __half *dA_values[k], *dB, *dC[k];
+    int    **dA_columns = new int*[k];
+    __half **dA_values = new __half*[k], **dC = new __half*[k], *dB;
 
     float alpha           = 1.0f;
     float beta            = 0.0f;
@@ -495,7 +496,6 @@ int main(int argc, char *argv[]) {
         total_blocks += A_num_blocks;
         blocksPerPart[i] = A_num_blocks;
         densityPart[i] = (double) nnzs_part/A_num_blocks;
-	//std::cout << densityPart[i] << std::endl;
         ghostBlocksPerPartition[i] = A_num_blocks - realBlocks;
 	totalGhostBlocks += A_num_blocks - realBlocks;
     }
@@ -503,7 +503,7 @@ int main(int argc, char *argv[]) {
     double elapsedTime, searchTime = 0;
     int numRuns=0;
 
-   /* for (int i=0; i<k; i++) {
+    /*for (int i=0; i<k; i++) {
         CHECK_CUSPARSE( cusparseSpMM(handle,
                         CUSPARSE_OPERATION_NON_TRANSPOSE,
                         CUSPARSE_OPERATION_NON_TRANSPOSE,
@@ -601,6 +601,9 @@ int main(int argc, char *argv[]) {
         cudaStreamDestroy(streams[i]);
     }
     
+    delete[] blocksPerPart;
+    delete[] ghostBlocksPerPartition;
+    delete[] densityPart;
     delete[] hB;
     delete[] rowPtr_pad;
     delete[] colIndex;
