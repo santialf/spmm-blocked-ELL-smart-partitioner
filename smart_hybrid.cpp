@@ -18,8 +18,8 @@
 #define SM_CORES 108
 #define MINIMUM_DENSITY 0
 #define MAXIMUM_GHOST_PERC 0.0000000000001
-#define A_ELL_BLOCKSIZE 32
-#define B_NUM_COLS 128
+#define A_ELL_BLOCKSIZE 16
+#define B_NUM_COLS 64
 
 #define CHECK_CUDA(func)                                                       \
 {                                                                              \
@@ -45,6 +45,16 @@ const int EXIT_UNSUPPORTED = 2;
 
 __half* createRandomArray(long int n) {
     __half* array = new __half[n];
+
+    for (int i = 0; i < n; i++) { 
+        array[i] = 1.0;
+    }
+
+    return array;
+}
+
+float* createRandomArrayCSR(long int n) {
+    float* array = new float[n];
 
     for (int i = 0; i < n; i++) { 
         array[i] = 1.0;
@@ -424,6 +434,14 @@ int main(int argc, char *argv[]) {
 					CUDA_R_16F, CUSPARSE_ORDER_COL) )
 
     int total_blocks = 0;
+
+    // CSR vectors and variables
+    int *rowPtr_csr = new int[A_num_rows + 1]();
+    int *colIndex_csr = new int[nz];
+    float *values_csr = new float[nz];
+    int ctr2 = 0;
+    int nnzs_csr = 0;
+    
     // Create blocked ELL for each partition of matrix A
     for (int i=0; i<k; i++){
         size_t bufferSize = 0;
@@ -440,133 +458,170 @@ int main(int argc, char *argv[]) {
         rowPtr_part[A_rows] = rowPtr_pad[ctr];
         long int nnzs_part = rowPtr_part[A_rows] - rowPtr_part[0];
 
-        int *colIndexCompress;
-        if (( (double)nnzs_part / (double) (colsOfBlocksPerPartition[i]*rowsOfBlocksPerPartition[i])) >= MINIMUM_DENSITY)
-            colIndexCompress = colIndex;
-        else
-            colIndexCompress = removeEmptyColumns(rowPtr_part, colIndex, A_rows, A_num_rows, A_nnz);
+        // Store CSR
+        if ((i < 1) || (i == k-1)) {
+            for (int j = 0; j < A_rows; j++) {
+                rowPtr_csr[ctr2++] = rowPtr_part[j];
+            }
+            for (int j = 0; j < A_rows; j++) {
+                for (int l = rowPtr_part[j]; l < rowPtr_part[j+1]; l++) {
+                    values_csr[nnzs_csr] = values[l];
+                    colIndex_csr[nnzs_csr++] = colIndex[l];
+                }
+            }
 
-        // Create blocked ELL vectors for partition
-        int   A_ell_cols      = findMaxNnz(rowPtr_part, colIndexCompress, A_rows, A_ell_blocksize);
-        //int   A_ell_cols      = findMaxNnz(rowPtr_part, colIndex, A_rows, A_ell_blocksize);
-        double   A_num_blocks    = (double)A_ell_cols * (double)A_rows /
-                            (A_ell_blocksize * A_ell_blocksize);
-        /*double   A_num_blocks_comp    = (double)A_ell_cols_comp * (double)A_rows /
-                            (A_ell_blocksize * A_ell_blocksize);
+        } else {
+	    //std::cout << rowsOfBlocksPerPartition[i] << " " << colsOfBlocksPerPartition[i] << std::endl;
+	    for (int l = 0; l < A_rows; l++)
+	    	rowPtr_csr[ctr2++] = nnzs_csr;
+	    
+            int *colIndexCompress;
+            if (( (double)nnzs_part / (double) (colsOfBlocksPerPartition[i]*rowsOfBlocksPerPartition[i])) >= MINIMUM_DENSITY)
+                colIndexCompress = colIndex;
+            else
+                colIndexCompress = removeEmptyColumns(rowPtr_part, colIndex, A_rows, A_num_rows, A_nnz);
 
-        if (A_num_blocks_comp >= A_num_blocks)
-            colIndexCompress = colIndex;
-        else {
-            A_num_blocks = A_num_blocks_comp;
-            A_ell_cols = A_ell_cols_comp;
-        }*/
+            // Create blocked ELL vectors for partition
+            int   A_ell_cols      = findMaxNnz(rowPtr_part, colIndexCompress, A_rows, A_ell_blocksize);
             
-        int realBlocks = 0;
-        int   *hA_columns     = createBlockIndex(rowPtr_part, colIndexCompress, A_rows, A_ell_blocksize, A_ell_cols, realBlocks);
-        __half *hA_values     = createValueIndex(rowPtr_part, colIndexCompress, values, hA_columns, A_rows, A_ell_blocksize, A_ell_cols);
+            double   A_num_blocks    = (double)A_ell_cols * (double)A_rows /
+                                (A_ell_blocksize * A_ell_blocksize);
+                
+            int realBlocks = 0;
+            int   *hA_columns     = createBlockIndex(rowPtr_part, colIndexCompress, A_rows, A_ell_blocksize, A_ell_cols, realBlocks);
+            __half *hA_values     = createValueIndex(rowPtr_part, colIndexCompress, values, hA_columns, A_rows, A_ell_blocksize, A_ell_cols);
 
-	    __half *hC 	      = new __half[(long int) A_rows * B_num_cols * sizeof(__half)];
+            __half *hC 	      = new __half[(long int) A_rows * B_num_cols * sizeof(__half)];
 
-        // Allocate and copy memory in GPU for blocked ELL vectors
-        CHECK_CUDA( cudaMalloc((void**) &dA_columns[i], (long int) A_num_blocks * sizeof(int)) )
-        CHECK_CUDA( cudaMalloc((void**) &dA_values[i],
-                                        (long int) A_ell_cols * A_rows * sizeof(__half)) )
-        CHECK_CUDA( cudaMalloc((void**) &dC[i], (long int) A_rows * B_num_cols * sizeof(__half)) )
-        
-        CHECK_CUDA( cudaMemcpy(dA_columns[i], hA_columns,
-                            (long int) A_num_blocks * sizeof(int),
-                            cudaMemcpyHostToDevice) )
-        CHECK_CUDA( cudaMemcpy(dA_values[i], hA_values,
-                            (long int) A_ell_cols * A_rows * sizeof(__half),
-                            cudaMemcpyHostToDevice) )
-        CHECK_CUDA( cudaMemcpy(dC[i], hC, (long int) A_rows * B_num_cols * sizeof(__half),
-                            cudaMemcpyHostToDevice) )
-                            
-        CHECK_CUSPARSE( cusparseCreateDnMat(&matC[i], A_rows, B_num_cols, A_rows, dC[i],
-					CUDA_R_16F, CUSPARSE_ORDER_COL) )
-        //--------------------------------------------------------------------------
-        
-        CHECK_CUSPARSE( cusparseCreate(&handle) )
-        // Create sparse matrix A in blocked ELL format
-        CHECK_CUSPARSE( cusparseCreateBlockedEll(
-                                        &matA[i],
-                                        A_rows, A_num_cols, A_ell_blocksize,
-                                        A_ell_cols, dA_columns[i], dA_values[i],
-                                        CUSPARSE_INDEX_32I,
-                                        CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F) )
-        
-        // allocate an external buffer if needed
-        CHECK_CUSPARSE( cusparseSpMM_bufferSize(
-                                    handle,
-                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                    CUSPARSE_OPERATION_NON_TRANSPOSE,
-                                    &alpha, matA[i], matB, &beta, matC[i], CUDA_R_32F,
-                                    CUSPARSE_SPMM_ALG_DEFAULT, &bufferSize) )
-        CHECK_CUDA( cudaMalloc(&dBuffer[i], bufferSize) )
-
-        total_blocks += A_num_blocks;
-        blocksPerPart[i] = A_num_blocks;
-        densityPart[i] = (double) nnzs_part/A_num_blocks;
-        ghostBlocksPerPartition[i] = A_num_blocks - realBlocks;
-	totalGhostBlocks += A_num_blocks - realBlocks;
-    }
-    struct timespec t_start, t_end;
-    double elapsedTime, searchTime = 0;
-    int numRuns=0;
-
-    /*for (int i=0; i<k; i++) {
-        CHECK_CUSPARSE( cusparseSpMM(handle,
-                        CUSPARSE_OPERATION_NON_TRANSPOSE,
-                        CUSPARSE_OPERATION_NON_TRANSPOSE,
-                        &alpha, matA[i], matB, &beta, matC[i], CUDA_R_32F,
-                        CUSPARSE_SPMM_ALG_DEFAULT, dBuffer[i]) )
-        cudaDeviceSynchronize();
-
-        // execute SpMM
-        clock_gettime(CLOCK_MONOTONIC, &t_start);       // initial timestamp
-        while (1) {
-            CHECK_CUSPARSE( cusparseSpMM(handle,
+            // Allocate and copy memory in GPU for blocked ELL vectors
+            CHECK_CUDA( cudaMalloc((void**) &dA_columns[i], (long int) A_num_blocks * sizeof(int)) )
+            CHECK_CUDA( cudaMalloc((void**) &dA_values[i],
+                                            (long int) A_ell_cols * A_rows * sizeof(__half)) )
+            CHECK_CUDA( cudaMalloc((void**) &dC[i], (long int) A_rows * B_num_cols * sizeof(__half)) )
+            
+            CHECK_CUDA( cudaMemcpy(dA_columns[i], hA_columns,
+                                (long int) A_num_blocks * sizeof(int),
+                                cudaMemcpyHostToDevice) )
+            CHECK_CUDA( cudaMemcpy(dA_values[i], hA_values,
+                                (long int) A_ell_cols * A_rows * sizeof(__half),
+                                cudaMemcpyHostToDevice) )
+            CHECK_CUDA( cudaMemcpy(dC[i], hC, (long int) A_rows * B_num_cols * sizeof(__half),
+                                cudaMemcpyHostToDevice) )
+                                
+            CHECK_CUSPARSE( cusparseCreateDnMat(&matC[i], A_rows, B_num_cols, A_rows, dC[i],
+                        CUDA_R_16F, CUSPARSE_ORDER_COL) )
+            //--------------------------------------------------------------------------
+            
+            CHECK_CUSPARSE( cusparseCreate(&handle) )
+            // Create sparse matrix A in blocked ELL format
+            CHECK_CUSPARSE( cusparseCreateBlockedEll(
+                                            &matA[i],
+                                            A_rows, A_num_cols, A_ell_blocksize,
+                                            A_ell_cols, dA_columns[i], dA_values[i],
+                                            CUSPARSE_INDEX_32I,
+                                            CUSPARSE_INDEX_BASE_ZERO, CUDA_R_16F) )
+            
+            // allocate an external buffer if needed
+            CHECK_CUSPARSE( cusparseSpMM_bufferSize(
+                                        handle,
                                         CUSPARSE_OPERATION_NON_TRANSPOSE,
                                         CUSPARSE_OPERATION_NON_TRANSPOSE,
                                         &alpha, matA[i], matB, &beta, matC[i], CUDA_R_32F,
-                                        CUSPARSE_SPMM_ALG_DEFAULT, dBuffer[i]) )
-            cudaDeviceSynchronize();
-            numRuns++;
+                                        CUSPARSE_SPMM_ALG_DEFAULT, &bufferSize) )
+            CHECK_CUDA( cudaMalloc(&dBuffer[i], bufferSize) )
 
-            clock_gettime(CLOCK_MONOTONIC, &t_end);         // final timestamp
-            elapsedTime = ((t_end.tv_sec + ((double) t_end.tv_nsec / 1000000000)) - (t_start.tv_sec + ((double) t_start.tv_nsec / 1000000000)));
-            if(elapsedTime > 5.0f) {
-                break;
-            }
+            total_blocks += A_num_blocks;
+            blocksPerPart[i] = A_num_blocks;
+            densityPart[i] = (double) nnzs_part/A_num_blocks;
+            ghostBlocksPerPartition[i] = A_num_blocks - realBlocks;
+            totalGhostBlocks += A_num_blocks - realBlocks;
         }
-        
-        searchTime += ((t_end.tv_sec + ((double) t_end.tv_nsec / 1000000000)) - (t_start.tv_sec + ((double) t_start.tv_nsec / 1000000000))) / numRuns;
-        double time_part = ((t_end.tv_sec + ((double) t_end.tv_nsec / 1000000000)) - (t_start.tv_sec + ((double) t_start.tv_nsec / 1000000000))) / numRuns;
-        double perf_part = (2* ((double)blocksPerPart[i]) * ((double)A_ell_blocksize*A_ell_blocksize) * ((double)B_num_cols) / 1000000000000) / time_part;
-        std::cout << i << "\tNumber Blocks: " << blocksPerPart[i] << "\tRows of blocks: " 
-                  << rowsOfBlocksPerPartition[i] << "\tColumns of blocks: " << colsOfBlocksPerPartition[i] << "\tDensity: " 
-                  << densityPart[i] << "\tGhost blocks: " << ghostBlocksPerPartition[i] 
-                  << " ( " << (double)ghostBlocksPerPartition[i]/(double)blocksPerPart[i]*(double)100 << " %)" << "\tPerf: " << perf_part << std::endl;
-        numRuns = 0;
-    }*/
+    }
+
+    // Allocate memory to CSR info
+    rowPtr_csr[ctr2] = nnzs_csr;
+    int   *hA1_csrOffsets = rowPtr_csr;
+    int   *hA1_columns    = colIndex_csr;
+    float *hA1_values     = values_csr;
+    int   *dA1_csrOffsets, *dA1_columns;
+    float *dA1_values, *dB1, *dC1;
+
+    float *hB1            = createRandomArrayCSR(B_size);
+    float *hC1            = new float[(long int) A_num_rows*B_num_cols*sizeof(float)];
+    
+
+    CHECK_CUDA( cudaMalloc((void**) &dA1_csrOffsets,
+                           (long int)(A_num_rows + 1) * sizeof(int)) )
+    CHECK_CUDA( cudaMalloc((void**) &dA1_columns, (long int)nnzs_csr * sizeof(int))    )
+    CHECK_CUDA( cudaMalloc((void**) &dA1_values,  (long int)nnzs_csr * sizeof(float))  )
+    CHECK_CUDA( cudaMalloc((void**) &dB1, (long int) B_size * sizeof(float)) )
+    CHECK_CUDA( cudaMalloc((void**) &dC1,         (long int)A_num_rows*B_num_cols * sizeof(float)) )
+
+    CHECK_CUDA( cudaMemcpy(dA1_csrOffsets, hA1_csrOffsets,
+                           (long int)(A_num_rows + 1) * sizeof(int),
+                           cudaMemcpyHostToDevice) )
+    CHECK_CUDA( cudaMemcpy(dA1_columns, hA1_columns, (long int)nnzs_csr * sizeof(int),
+                           cudaMemcpyHostToDevice) )
+    CHECK_CUDA( cudaMemcpy(dA1_values, hA1_values, (long int)nnzs_csr * sizeof(float),
+                           cudaMemcpyHostToDevice) )
+    CHECK_CUDA( cudaMemcpy(dB1, hB1, (long int) B_size * sizeof(float),
+                           cudaMemcpyHostToDevice) )
+    CHECK_CUDA( cudaMemcpy(dC1, hC1, (long int) A_num_rows*B_num_cols * sizeof(float),
+			   cudaMemcpyHostToDevice) )
+
+    // CUSPARSE APIs CSR
+    cusparseHandle_t     handle1 = NULL;
+    cusparseSpMatDescr_t matA1;
+    cusparseDnMatDescr_t matB1, matC1;
+    void*                dBuffer1    = NULL;
+    size_t               bufferSize1 = 0;
+    CHECK_CUSPARSE( cusparseCreate(&handle1) )
+    // Create sparse matrix A in CSR format
+    CHECK_CUSPARSE( cusparseCreateCsr(&matA1, A_num_rows, A_num_cols, nnzs_csr,
+                                      dA1_csrOffsets, dA1_columns, dA1_values,
+                                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F) )
+    // Create dense matrix B
+    CHECK_CUSPARSE( cusparseCreateDnMat(&matB1, A_num_cols, B_num_cols, ldb, dB1,
+                                        CUDA_R_32F, CUSPARSE_ORDER_COL) )
+    // Create dense matrix C
+    CHECK_CUSPARSE( cusparseCreateDnMat(&matC1, A_num_rows, B_num_cols, A_num_rows, dC1,
+                                        CUDA_R_32F, CUSPARSE_ORDER_COL) )
+    // allocate an external buffer if needed
+    CHECK_CUSPARSE( cusparseSpMM_bufferSize(
+                                 handle1,
+                                 CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                 CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                 &alpha, matA1, matB1, &beta, matC1, CUDA_R_32F,
+                                 CUSPARSE_SPMM_ALG_DEFAULT, &bufferSize1) )
+    CHECK_CUDA( cudaMalloc(&dBuffer1, bufferSize1) )
+    //-----------------------
+
+    struct timespec t_start, t_end;
+    double elapsedTime, searchTime = 0;
+    int numRuns=0;
     
     std::vector<cudaStream_t> streams(k);
-    for (int i = 0; i < k; ++i) {
+    for (int i = 1; i < k; ++i) {
 	    cudaStreamCreate(&streams[i]);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t_start);
     while (1) {
         
-        for (int i=0; i<k; i++) {
+        for (int i=1; i<k-1; i++) {
 	        CHECK_CUSPARSE( cusparseSetStream(handle, streams[i]) );
             CHECK_CUSPARSE( cusparseSpMM(handle,
                                         CUSPARSE_OPERATION_NON_TRANSPOSE,
                                         CUSPARSE_OPERATION_NON_TRANSPOSE,
                                         &alpha, matA[i], matB, &beta, matC[i], CUDA_R_32F,
                                         CUSPARSE_SPMM_ALG_DEFAULT, dBuffer) )
-            //cudaDeviceSynchronize();
         }
+        CHECK_CUSPARSE( cusparseSpMM(handle1,
+                                CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                &alpha, matA1, matB1, &beta, matC1, CUDA_R_32F,
+                                CUSPARSE_SPMM_ALG_DEFAULT, dBuffer1) )
         cudaDeviceSynchronize();
         numRuns++;
 
@@ -586,7 +641,7 @@ int main(int argc, char *argv[]) {
     std::cout << "\tParts: " << k <<"\tTotal Blocks: " << total_blocks << " (density: " << (double) A_nnz/total_blocks << " )" << "\tTime (seconds): " << searchTime << "\tPerf: " << tflops_bell << "\tGhost Blocks: " << totalGhostBlocks << " ( " << (double)totalGhostBlocks/(double)total_blocks*(double)100 << " %)" <<std::endl;
 
     // destroy matrix/vector descriptors
-    for (int i=0; i<k; i++) {
+    for (int i=1; i<k-1; i++) {
         CHECK_CUSPARSE( cusparseDestroySpMat(matA[i]) )
 	    CHECK_CUSPARSE( cusparseDestroyDnMat(matC[i]) )
     }
@@ -595,7 +650,7 @@ int main(int argc, char *argv[]) {
     //--------------------------------------------------------------------------
     // device result check
     __half *hC[k];
-    for (int i=0; i<k; i++){
+    for (int i=1; i<k-1; i++){
 	hC[i] = new __half[(long int) rowsOfBlocksPerPartition[i] * A_ell_blocksize * B_num_cols * sizeof(__half)];
     	CHECK_CUDA( cudaMemcpy(hC[i], dC[i], (long int) rowsOfBlocksPerPartition[i] * A_ell_blocksize * B_num_cols * sizeof(__half),
                         	cudaMemcpyDeviceToHost) )
@@ -604,7 +659,7 @@ int main(int argc, char *argv[]) {
     //--------------------------------------------------------------------------
     // device memory deallocation
     CHECK_CUDA( cudaFree(dB) )
-    for (int i=0; i<k; i++) {
+    for (int i=1; i<k-1; i++) {
         CHECK_CUDA( cudaFree(dBuffer[i]) )
         CHECK_CUDA( cudaFree(dC[i]) )
         CHECK_CUDA( cudaFree(dA_columns[i]) )

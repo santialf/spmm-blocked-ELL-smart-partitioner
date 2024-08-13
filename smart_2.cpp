@@ -1,8 +1,8 @@
 #include <cuda_fp16.h>        // data types
 #include <cuda_runtime_api.h> // cudaMalloc, cudaMemcpy, etc.
 #include <cusparse.h>         // cusparseSpMM
-#include <cstdio>            // printf
-#include <cstdlib>           // EXIT_FAILURE
+#include <cstdio>             // printf
+#include <cstdlib>            // EXIT_FAILURE
 
 #include <string.h>
 #include <time.h>
@@ -16,10 +16,10 @@
 #include "smsh.c"
 
 #define SM_CORES 108
-#define MINIMUM_DENSITY 0
+//#define MINIMUM_DENSITY 0
 #define MAXIMUM_GHOST_PERC 0.0000000000001
 #define A_ELL_BLOCKSIZE 32
-#define B_NUM_COLS 64
+#define B_NUM_COLS 128
 
 #define CHECK_CUDA(func)                                                       \
 {                                                                              \
@@ -180,7 +180,7 @@ __half *createValueIndex(int *rowPtr, int *colIndex, float *values, int *hA_colu
     return hA_values;
 }
 
-int* removeEmptyColumns(int *&rowPtr_part, int *&colIndex, int A_rows, int A_cols, int A_nnz) {
+/*int* removeEmptyColumns(int *&rowPtr_part, int *&colIndex, int A_rows, int A_cols, int A_nnz) {
 
     //create vector to store non-empy columns
     std::set<int>nonEmptyCols;
@@ -209,7 +209,7 @@ int* removeEmptyColumns(int *&rowPtr_part, int *&colIndex, int A_rows, int A_col
     }
 
     return colIndexNew;
-}
+}*/
 
 int main(int argc, char *argv[]) {
 
@@ -440,19 +440,21 @@ int main(int argc, char *argv[]) {
         rowPtr_part[A_rows] = rowPtr_pad[ctr];
         long int nnzs_part = rowPtr_part[A_rows] - rowPtr_part[0];
 
-        int *colIndexCompress;
-        if (( (double)nnzs_part / (double) (colsOfBlocksPerPartition[i]*rowsOfBlocksPerPartition[i])) >= MINIMUM_DENSITY)
-            colIndexCompress = colIndex;
-        else
-            colIndexCompress = removeEmptyColumns(rowPtr_part, colIndex, A_rows, A_num_rows, A_nnz);
+        //int *colIndexCompress;
+        //if (( (double)nnzs_part / (double) (colsOfBlocksPerPartition[i]*rowsOfBlocksPerPartition[i])) >= MINIMUM_DENSITY)
+          //  colIndexCompress = colIndex;
+        //else
+            //colIndexCompress = removeEmptyColumns(rowPtr_part, colIndex, A_rows, A_num_rows, A_nnz);
 
         // Create blocked ELL vectors for partition
-        int   A_ell_cols      = findMaxNnz(rowPtr_part, colIndexCompress, A_rows, A_ell_blocksize);
+        int   A_ell_cols      = findMaxNnz(rowPtr_part, colIndex, A_rows, A_ell_blocksize);
+        
         double   A_num_blocks    = (double)A_ell_cols * (double)A_rows /
                             (A_ell_blocksize * A_ell_blocksize);
+            
         int realBlocks = 0;
-        int   *hA_columns     = createBlockIndex(rowPtr_part, colIndexCompress, A_rows, A_ell_blocksize, A_ell_cols, realBlocks);
-        __half *hA_values     = createValueIndex(rowPtr_part, colIndexCompress, values, hA_columns, A_rows, A_ell_blocksize, A_ell_cols);
+        int   *hA_columns     = createBlockIndex(rowPtr_part, colIndex, A_rows, A_ell_blocksize, A_ell_cols, realBlocks);
+        __half *hA_values     = createValueIndex(rowPtr_part, colIndex, values, hA_columns, A_rows, A_ell_blocksize, A_ell_cols);
 
 	    __half *hC 	      = new __half[(long int) A_rows * B_num_cols * sizeof(__half)];
 
